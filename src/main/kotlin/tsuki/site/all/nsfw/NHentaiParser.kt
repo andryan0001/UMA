@@ -20,6 +20,7 @@ import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
 
 import tsuki.util.generateUid
+import tsuki.util.parseBytes
 import tsuki.util.parseJson
 import tsuki.util.urlEncoded
 
@@ -27,10 +28,15 @@ import org.json.JSONObject
 import java.util.EnumSet
 import java.util.Locale
 
-// removed first server, it has always problems
 private const val TWO_IMG_SERVER = "2"
 private const val THREE_IMG_SERVER = "3"
 private const val FOUR_IMG_SERVER = "4"
+
+// Small, permanent files used to check whether a CDN host is reachable
+private const val THUMB_SAMPLE = "galleries/9/thumb.jpg"
+private val FALLBACK_IMAGE_SERVERS = (1..4).map { "https://i$it.nhentai.net" }
+private val FALLBACK_THUMB_SERVERS = (1..4).map { "https://t$it.nhentai.net" }
+private val GALLERY_URL_REGEX = Regex("""(?:^|/)g/(\d+)""")
 
 @MangaSourceParser("NHENTAI", "NHentai.net", type = ContentType.HENTAI)
 internal class NHentaiParser(context: MangaLoaderContext) :
@@ -39,10 +45,14 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 
     override val configKeyDomain = ConfigKey.Domain("nhentai.net")
 
+    private var imageServers: List<String> = emptyList()
+    private var thumbServers: List<String> = emptyList()
     private var imageServer: String = ""
     private var thumbServer: String = ""
+    private var imageServerVerified = false
+    private var lastGallery: Pair<Int, JSONObject>? = null
 
-    private var displayFullTitle: Boolean = true
+    private val displayFullTitle: Boolean = true
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
         SortOrder.UPDATED,      // latest (default)
@@ -60,9 +70,9 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 
     private val preferredServerKey = ConfigKey.PreferredImageServer(
         presetValues = mapOf(
-            TWO_IMG_SERVER to "First server",
-            THREE_IMG_SERVER to "Second server",
-            FOUR_IMG_SERVER to "Third server",
+            TWO_IMG_SERVER to "Server 2",
+            THREE_IMG_SERVER to "Server 3",
+            FOUR_IMG_SERVER to "Server 4",
         ),
         defaultValue = TWO_IMG_SERVER,
     )
@@ -713,7 +723,7 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 15914=sasuke uchiha
 2774=kyouko sakura
 80930=abigail williams
-81288=gudao | ritsuka fujimaru
+81288=gudao-ritsuka-fujimaru
 73756=nightingale
 6109=eri ayase
 27492=akagi
@@ -817,10 +827,10 @@ internal class NHentaiParser(context: MangaLoaderContext) :
     }
 
     override suspend fun getFilterOptions() = MangaListFilterOptions(
-        availableTags = nhTagMap.map { (_, name) ->
+        availableTags = nhTagMap.values.map { slug ->
             MangaTag(
-                title = name.replace("-", " ").replaceFirstChar { it.uppercase() },
-                key = name.replace(" ", "-"),
+                title = slug.replace("-", " ").replaceFirstChar { it.uppercase() },
+                key = slug,
                 source = source,
             )
         }.toSet(),
@@ -832,22 +842,67 @@ internal class NHentaiParser(context: MangaLoaderContext) :
     )
 
     private suspend fun ensureNhConfig() {
-        if (imageServer.isBlank() || thumbServer.isBlank()) {
+        if (imageServer.isNotBlank() && thumbServer.isNotBlank()) return
+        if (imageServers.isEmpty() || thumbServers.isEmpty()) {
             try {
                 val json = webClient.httpGet("https://$domain/api/v2/config").parseJson()
-                val imgServers = json.getJSONArray("image_servers")
-                    .let { (0 until it.length()).map { i -> it.getString(i) } }
-                val thbServers = json.getJSONArray("thumb_servers")
-                    .let { (0 until it.length()).map { i -> it.getString(i) } }
-                imageServer = imgServers[selectedServer.toInt() - 1]
-                thumbServer = thbServers[selectedServer.toInt() - 1]
+                imageServers = json.getJSONArray("image_servers").toStringList()
+                thumbServers = json.getJSONArray("thumb_servers").toStringList()
             } catch (_: Exception) {
-                imageServer = "https://i$selectedServer.nhentai.net"
-                thumbServer = "https://t$selectedServer.nhentai.net"
+                // Network unavailable, fall back to the known hosts below
+            }
+            if (imageServers.isEmpty()) imageServers = FALLBACK_IMAGE_SERVERS
+            if (thumbServers.isEmpty()) thumbServers = FALLBACK_THUMB_SERVERS
+        }
+        val order = preferredServerOrder(thumbServers.size)
+        val index = order.firstOrNull { isServerAlive("${thumbServers[it]}/$THUMB_SAMPLE") } ?: order.first()
+        thumbServer = thumbServers[index]
+        imageServer = imageServers.getOrElse(index) { imageServers.first() }
+    }
+
+    private fun org.json.JSONArray.toStringList(): List<String> =
+        (0 until length()).map { getString(it) }
+
+    // The preferred server goes first, the rest are used as fallbacks
+    private fun preferredServerOrder(size: Int): List<Int> {
+        val indices = (0 until size).toList()
+        val preferred = selectedServer.toIntOrNull()?.minus(1) ?: return indices
+        return if (preferred in indices) listOf(preferred) + indices.filter { it != preferred } else indices
+    }
+
+    private suspend fun isServerAlive(url: String): Boolean = try {
+        webClient.httpGet(url).parseBytes()
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private suspend fun ensureImageServer(samplePath: String) {
+        if (imageServerVerified || imageServers.isEmpty()) return
+        imageServerVerified = true
+        val current = imageServers.indexOf(imageServer)
+        val order = preferredServerOrder(imageServers.size)
+            .let { if (current == -1) it else listOf(current) + it.filter { i -> i != current } }
+        for (index in order) {
+            val candidate = imageServers.getOrNull(index) ?: continue
+            if (isServerAlive("$candidate/$samplePath")) {
+                imageServer = candidate
+                return
             }
         }
     }
 
+    private suspend fun galleryJson(id: Int): JSONObject {
+        lastGallery?.let { (cachedId, json) -> if (cachedId == id) return json }
+        val json = webClient.httpGet("https://$domain/api/v2/galleries/$id").parseJson()
+        lastGallery = id to json
+        return json
+    }
+
+    private fun mangaId(url: String): Int {
+        GALLERY_URL_REGEX.find(url)?.let { return it.groupValues[1].toInt() }
+        return url.filter(Char::isDigit).toInt()
+    }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
         ensureNhConfig()
@@ -862,10 +917,11 @@ internal class NHentaiParser(context: MangaLoaderContext) :
         }
 
         val lang = filter.locale?.let { LANG_MAP[it.language] }
+        val query = filter.query?.trim()?.replace('"', '\'') ?: ""
 
         val searchQuery = buildString {
-            if (!filter.query.isNullOrBlank()) {
-                append("title:\"${filter.query!!.trim()}\"")
+            if (query.isNotEmpty()) {
+                append("title:\"$query\"")
             }
             filter.tags.forEach { tag ->
                 if (isNotEmpty()) append(" ")
@@ -905,55 +961,58 @@ internal class NHentaiParser(context: MangaLoaderContext) :
 
         val json = webClient.httpGet(url).parseJson()
         val items = json.getJSONArray("result")
-        return (0 until items.length()).map { i -> items.getJSONObject(i).toManga() }
-    }
-
-    private fun extractGalleryId(query: String?): Int? {
-        if (query.isNullOrBlank()) return null
-        val trimmed = query.trim()
-        return when {
-            trimmed.startsWith("id:") -> trimmed.removePrefix("id:").toIntOrNull()
-            trimmed.all(Char::isDigit) -> trimmed.toIntOrNull()
-            else -> null
+        return (0 until items.length()).mapNotNull { i ->
+            items.getJSONObject(i).takeUnless { it.optBoolean("blacklisted") }?.toManga()
         }
     }
 
-    private suspend fun fetchMangaById(id: Int): Manga {
-        ensureNhConfig()
-        val json = webClient.httpGet("https://$domain/api/v2/galleries/$id").parseJson()
-        return json.toMangaDetails()
+    private fun extractGalleryId(query: String?): Int? {
+        val trimmed = query?.trim().orEmpty()
+        return when {
+            trimmed.isEmpty() -> null
+            trimmed.startsWith("id:") -> trimmed.removePrefix("id:").toIntOrNull()
+            trimmed.all(Char::isDigit) -> trimmed.toIntOrNull()
+            else -> GALLERY_URL_REGEX.find(trimmed)?.groupValues?.get(1)?.toIntOrNull()
+        }
     }
+
+    private suspend fun fetchMangaById(id: Int): Manga = galleryJson(id).toMangaDetails()
 
     override suspend fun getDetails(manga: Manga): Manga {
         ensureNhConfig()
-        val id = manga.url.removeSurrounding("/g/", "/").toInt()
-        val json = webClient.httpGet("https://$domain/api/v2/galleries/$id").parseJson()
-        return json.toMangaDetails().copy(
-            coverUrl = manga.coverUrl?.ifBlank {
-                "${thumbServer}/${json.getJSONObject("cover").optString("path")}"
-            },
-        )
+        return galleryJson(mangaId(manga.url)).toMangaDetails()
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         ensureNhConfig()
-        val id = chapter.url.removeSurrounding("/g/", "/").toInt()
-        val json = webClient.httpGet("https://$domain/api/v2/galleries/$id").parseJson()
+        val json = galleryJson(mangaId(chapter.url))
         val pagesArray = json.getJSONArray("pages")
+        pagesArray.optJSONObject(0)?.optString("path")?.takeIf { it.isNotBlank() }
+            ?.let { ensureImageServer(it) }
         return (0 until pagesArray.length()).map { i ->
             val pageObj = pagesArray.getJSONObject(i)
             val path = pageObj.getString("path")
             MangaPage(
                 id = generateUid(path),
                 url = "$imageServer/$path",
-                preview = null,
+                preview = pageObj.optString("thumbnail").takeIf { it.isNotBlank() }
+                    ?.let { "$thumbServer/$it" },
                 source = source,
             )
         }
     }
 
     override suspend fun getPageUrl(page: MangaPage): String = page.url
-    override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
+
+    override suspend fun getRelatedManga(seed: Manga): List<Manga> {
+        ensureNhConfig()
+        val json = webClient.httpGet("https://$domain/api/v2/galleries/${mangaId(seed.url)}/related")
+            .parseJson()
+        val items = json.optJSONArray("result") ?: return emptyList()
+        return (0 until items.length()).mapNotNull { i ->
+            items.getJSONObject(i).takeUnless { it.optBoolean("blacklisted") }?.toManga()
+        }
+    }
 
     private fun JSONObject.toManga(): Manga {
         val id = getInt("id")
@@ -1004,7 +1063,6 @@ internal class NHentaiParser(context: MangaLoaderContext) :
         val groups = getTagsOfType("group")
         val author = artists.joinToString(", ").ifBlank { groups.joinToString(", ") }
 
-        var langName: String?
         var translated = false
         val languageCandidates = mutableListOf<String>()
 
@@ -1019,7 +1077,7 @@ internal class NHentaiParser(context: MangaLoaderContext) :
             }
         }
 
-        langName = languageCandidates.firstOrNull { it.equals("chinese", ignoreCase = true) }
+        val langName = languageCandidates.firstOrNull { it.equals("chinese", ignoreCase = true) }
             ?: languageCandidates.firstOrNull { it.equals("japanese", ignoreCase = true) }
                     ?: languageCandidates.firstOrNull { it.equals("english", ignoreCase = true) }
                     ?: languageCandidates.firstOrNull()
@@ -1068,10 +1126,11 @@ internal class NHentaiParser(context: MangaLoaderContext) :
         val tagsArray = optJSONArray("tags") ?: return emptySet()
         return (0 until tagsArray.length()).map { i ->
             val tag = tagsArray.getJSONObject(i)
-            val name = tag.getString("name")
+            val name = tag.optString("name").ifBlank { tag.optString("slug") }
+            val slug = tag.optString("slug").ifBlank { name.replace(" ", "-") }
             MangaTag(
                 title = name.replace("-", " ").replaceFirstChar { it.uppercase() },
-                key = "${tag.getString("type")}:$name",
+                key = "${tag.getString("type")}:$slug",
                 source = source,
             )
         }.toSet()
