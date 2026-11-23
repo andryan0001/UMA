@@ -114,8 +114,9 @@ class CGBUM(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = if (!filter.query.isNullOrBlank()) {
-            buildSearchUrl(page, filter.query.trim())
+        val query = filter.query?.trim()
+        val url = if (!query.isNullOrEmpty()) {
+            buildSearchUrl(page, query)
         } else {
             buildBrowseUrl(page, order, filter)
         }
